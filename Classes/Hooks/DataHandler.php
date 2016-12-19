@@ -32,9 +32,11 @@ namespace DmitryDulepov\Realurl\Hooks;
 use DmitryDulepov\Realurl\Cache\CacheFactory;
 use DmitryDulepov\Realurl\Cache\CacheInterface;
 use DmitryDulepov\Realurl\EncodeDecoderBase;
+use DmitryDulepov\Realurl\Configuration\ConfigurationReader;
 use TYPO3\CMS\Backend\Utility\BackendUtility;
 use TYPO3\CMS\Core\SingletonInterface;
 use TYPO3\CMS\Core\Utility\MathUtility;
+use TYPO3\CMS\Core\Utility\GeneralUtility;
 
 class DataHandler implements SingletonInterface {
 
@@ -134,17 +136,49 @@ class DataHandler implements SingletonInterface {
 				$tableName = 'pages';
 			}
 			$expirationTime = time() + 30*24*60*60;
+
+			// !ian (see #361 and #362) check if the record is a translation, in that case use the parent uid as $recordId and it's language uid as lang
+			$languageId = 0;
+			$configuration = GeneralUtility::makeInstance('DmitryDulepov\\Realurl\\Configuration\\ConfigurationReader', ConfigurationReader::MODE_DECODE);
+			$postVarSets = array_filter((array)$configuration->get('postVarSets/_DEFAULT'));
+			foreach ($postVarSets as $key => $postVarSet) {
+				foreach ($postVarSet as $key2 => $postVarSetConf) {
+					if ($postVarSetConf['lookUpTable']['table'] == $tableName) {
+						$transOrigPointerField = $postVarSets[$key][$key2]['lookUpTable']['transOrigPointerField'];
+						$languageField = $postVarSets[$key][$key2]['lookUpTable']['languageField'];
+						if ($transOrigPointerField != '' && $languageField !='') {
+							$record = $this->databaseConnection->exec_SELECTgetSingleRow(
+								$transOrigPointerField . ',' . $languageField,
+								$tableName,
+								'uid = ' . (int)$recordId . BackendUtility::BEenableFields($tableName) . BackendUtility::deleteClause($tableName)
+							);
+							if ($record && $record[$languageField] != '0') {
+								$recordId = (int)$record[$transOrigPointerField];
+								$languageId = (int)$record[$languageField];
+							}
+						}
+						break 2;
+					}
+				}
+			}
+			// !ian <end>
+
 			// This check would be sufficient for most cases but only when id_field is 'uid' in the configuration
+			// !ian (see #361 and #362) use the uid of the parent (found with the above code) if this is a translated record and also use languageUid to select only one language alias
 			$result = $this->databaseConnection->sql_query(
 				'SELECT uid,expire,url_cache_id FROM ' .
 				'tx_realurl_uniqalias LEFT JOIN tx_realurl_uniqalias_cache_map ON uid=alias_uid ' .
 				'WHERE tablename=' . $this->databaseConnection->fullQuoteStr($tableName, 'tx_realurl_uniqalias') . ' ' .
-				'AND value_id=' . $recordId
+				'AND value_id=' . $recordId . ' AND lang=' . $languageId
 			);
 			while (FALSE !== ($data = $this->databaseConnection->sql_fetch_assoc($result))) {
 				if ($data['url_cache_id']) {
 					$this->cache->clearUrlCacheById($data['url_cache_id']);
 				}
+
+				// !ian (see #361 and #362) delete also tx_realurl_uniqalias records
+				$this->databaseConnection->exec_DELETEquery('tx_realurl_uniqalias', 'tablename=' . $this->databaseConnection->fullQuoteStr($tableName, 'tx_realurl_uniqalias') . ' AND value_id=' . $recordId . ' AND lang=' . $languageId);
+
 				if ((int)$data['expire'] === 0) {
 					$this->databaseConnection->exec_UPDATEquery('tx_realurl_uniqalias', 'uid=' . (int)$data['uid'], array(
 						'expire' => $expirationTime
